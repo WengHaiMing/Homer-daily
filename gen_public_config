@@ -1,0 +1,540 @@
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <arpa/inet.h>
+#include <time.h>
+#include <getopt.h>
+#include "ccmysql.h"
+#include "utils.h"
+#include "db.h"
+
+#define LISTEN_CONFIG_PATH		"/root/yssbc/etc/opensips/include_listen.cfg"
+#define LISTEN_CUSTOM_PATH			"/root/yssbc/etc/opensips/listen.custom"
+#define WHITEIP_TMP_PATH			"/tmp/sshwhiteip.tmp"
+#define IPMASK_TMP_PATH			"/root/yssbc/conf/customipmask"
+#define YSSC_PATH					"/yeasafe/yssc/conf/yssc.conf"
+#define INCLUDE_MODULES_PATH		"/root/yssbc/etc/opensips/include_modules.cfg"
+#define OPENSIPS_CFG_PATH			"/root/yssbc/etc/opensips/opensips.cfg"
+#define DATABASE_FILE_PATH		"/root/yssbc/mydb/db.sql"
+#define DATABASE_NAME				"ysopensips"
+
+static const struct option long_options[]={
+	 {"gen_yssc",				no_argument, 		NULL, 'y'}, 		/*generate yssc config*/
+	 {"gen_ipmask", 			no_argument, 		NULL, 'i'}, 		/*generate sbc ipmask*/
+	 {"gen_usragent",  			optional_argument, 	NULL, 'u'}, 		/*genrate sbc useragent*/
+	 {"gen_http_cert", 			no_argument, 		NULL, 'c'}, 		/*generate webrtc https cert*/
+	 {"chk_spsport", 	 		no_argument,		NULL, 's'}, 		/*check if the spsport is open.if open, close it*/
+	 {"gen_pub_conf", 			no_argument, 		NULL, 'p'}, 		/*generate sbc public configuration*/
+	 {"start_rtpengine", 			no_argument, 		NULL, 'r'}, 		/*start rtpengine*/
+	 {NULL,					0,			NULL, 0}
+};
+
+int gen_yssc()
+{
+	int i = 0;
+	int ret = -1;
+	int count = 0;
+	FILE *fp = NULL;
+	struct Fail2Ban *fail2ban = NULL;
+	struct Dynamic_Defense *dynamic_defense = NULL;
+
+	if(utils_file_existed(YSSC_PATH)){
+		utils_syscmd_output(NULL, 0, "rm %s", YSSC_PATH);
+	}
+
+	db_read_fail2ban(&fail2ban);
+	db_read_dynamic_defense(&dynamic_defense, &count);
+	if(!fail2ban || !dynamic_defense) {
+		ret = -1;
+		goto ysscend;
+	}
+
+	fp = fopen(YSSC_PATH, "w+");
+	if(!fp) {
+		ret = -1;
+		goto ysscend;
+	}
+	fprintf(fp, "{\n");
+	fprintf(fp, "\t\"fail2ban\":{\n");
+	fprintf(fp, "\t\t\"interval\":%s,\n", 	fail2ban->inter);
+	fprintf(fp, "\t\t\"tries\":%s,\n", 		fail2ban->tries);
+	fprintf(fp, "\t\t\"block\":%s\n", 		fail2ban->block);
+	fprintf(fp, "\t},\n");
+	fprintf(fp, "\t\"dynamic_defense\":[\n");
+	
+	for(i=0; i < count; i++) {
+		char port_value[16] = {0};
+		
+		memset(port_value, 0, sizeof(port_value));
+		db_read_service_by_type_name(port_value, dynamic_defense[i].port, sizeof(port_value));
+		fprintf(fp, "\t\t{\"name\":\"%s\", \"port\":%s, \"enable\":%s, \"protocol\":\"%s\", \"packets\":%s, \"interval\":%s}",
+			dynamic_defense[i].name, port_value, dynamic_defense[i].enable,
+			dynamic_defense[i].protocol, dynamic_defense[i].packets, dynamic_defense[i].inter);
+		if(i == count-1){
+			fprintf(fp, "\n");
+		}else {
+			fprintf(fp, ",\n");
+		}
+	}
+	fprintf(fp, "\t]\n");
+	fprintf(fp, "}\n");
+	utils_safe_system("systemctl restart yssc");
+	ret = 0;
+
+ysscend:
+	if(fp) {
+		fclose(fp);
+	}
+	if(fail2ban) {
+		utils_free((void**)&fail2ban);
+	}
+	if(dynamic_defense){
+		utils_free((void**)&dynamic_defense);
+	}
+	return ret;
+}
+
+int gen_http_cert()
+{
+	struct YMPMap *ymp_map = NULL;
+	int ymp_count = 0;
+
+	db_read_ympmap(&ymp_map, &ymp_count);
+	if(!ymp_map){
+		return -1;
+	}
+
+	utils_syscmd_output(NULL, 0, "sed -i '/modparam(\\\"tls_mgm\\\",\\\"certificate\\\"/d' %s", INCLUDE_MODULES_PATH);
+	utils_syscmd_output(NULL, 0, "sed -i '/modparam(\\\"tls_mgm\\\",\\\"private_key\\\"/d' %s", INCLUDE_MODULES_PATH);
+	utils_syscmd_output(NULL, 0, "echo \"modparam(\\\"tls_mgm\\\",\\\"certificate\\\", \\\"%s\\\")\" >>%s", ymp_map[0].pubcertpath, INCLUDE_MODULES_PATH);
+	utils_syscmd_output(NULL, 0, "echo \"modparam(\\\"tls_mgm\\\",\\\"private_key\\\", \\\"%s\\\")\" >>%s", ymp_map[0].pricertpath, INCLUDE_MODULES_PATH);
+
+	utils_free((void **)&ymp_map);
+	return 0;
+}
+
+int gen_database()
+{
+	if (db_check_exist(DATABASE_NAME)) {
+		utils_syscmd_output(NULL, 0, "opensipsdbctl create");
+	}
+	mysql_source(DATABASE_NAME, "/root/yssbc/mydb/db.sql");
+	return 0;
+}
+
+int gen_ipmask()
+{
+	char ipmask[128] = {0};
+
+	if (utils_file_existed(IPMASK_TMP_PATH)) {
+		return -1;
+	}
+	while(1) {
+		char gateway[64] = {0};
+		char netmask[64] = {0};
+
+		printf("Please enter gateway and netmask, you can enter like this\nFor Exmple:\n192.168.1.0/255.255.255.0\n");
+		printf("Please enter:");
+		fgets(ipmask, sizeof(ipmask), stdin);
+		ipmask[strlen(ipmask) - 1] = '\0';
+		sscanf(ipmask, "%[^/]/%s", gateway, netmask);
+		
+		if (is_ipaddr(gateway) && is_ipaddr(netmask)) {
+			break;
+		}
+	}
+	utils_syscmd_output(NULL, 0, "echo '%s' > %s", ipmask, IPMASK_TMP_PATH);
+
+	return 0;
+}
+
+int gen_useragent(char *org_ver)
+{
+	char cur_ver[16] = {0};
+
+	utils_syscmd_output(cur_ver, sizeof(cur_ver), "cat /root/yssbc/version");
+	if(!strlen(cur_ver)){
+		return -1;
+	}
+	cur_ver[strlen(cur_ver)-1] = '\0';
+	utils_syscmd_output(NULL, 0, "sed -i 's/append_hf(\"YSUser-Agent:YSBC\\\\r\\\\n\", \"Max-Forwards\");/append_hf(\"YSUser-Agent:YSBC %s\\\\r\\\\n\", \"Max-Forwards\");/g' %s", cur_ver, OPENSIPS_CFG_PATH);
+	utils_syscmd_output(NULL, 0, "sed -i 's/append_hf(\"YSUser-Agent:YSBC %s\\\\r\\\\n\", \"Max-Forwards\");/append_hf(\"YSUser-Agent:YSBC %s\\\\r\\\\n\", \"Max-Forwards\");/g' %s", org_ver, cur_ver, OPENSIPS_CFG_PATH);
+
+
+	utils_syscmd_output(NULL, 0, "sed -i '/user_agent_header/d' %s", INCLUDE_MODULES_PATH);
+	utils_syscmd_output(NULL, 0, "sed -i '/server_header/d' %s", INCLUDE_MODULES_PATH);
+	utils_syscmd_output(NULL, 0, "echo \"user_agent_header=\\\"User-Agent:YSBC %s\\\"\" >>%s", cur_ver, INCLUDE_MODULES_PATH);
+	utils_syscmd_output(NULL, 0, "echo \"server_header=\\\"User-Agent:YSBC %s\\\"\" >>%s", cur_ver, INCLUDE_MODULES_PATH);
+}
+
+int  check_spsport()
+{
+	int ret = -1;
+	int max_port_value = 0;
+	struct PublicPort cur_sps_flag = {"spsportflag", ""};
+	struct PublicPort cur_sps_range = {"spsport", ""};
+	struct PublicPort new_sps_flag = {0};
+	struct PublicPort new_sps_range = {0};
+
+	if(db_read_read_publicport(&cur_sps_flag) || strcmp(cur_sps_flag.portvalue, "0")){
+		return ret;
+	}
+
+	db_read_read_publicport(&cur_sps_range);
+	if(!strcmp(cur_sps_range.portvalue, "7000-7099")) {
+		db_read_max_from_spsportmanage_by_flag(&max_port_value);
+		if(max_port_value < 7050) {
+			snprintf(new_sps_range.portvalue, sizeof(new_sps_range.portvalue), "7000-7050");
+			snprintf(new_sps_range.portname, sizeof(new_sps_range.portname), "spsport");
+			db_update_publicport_by_name(&new_sps_range);
+		}
+	}
+
+	snprintf(new_sps_flag.portname, sizeof(new_sps_flag.portname), "spsportflag");
+	snprintf(new_sps_flag.portvalue, sizeof(new_sps_flag.portvalue), "1");
+	ret = db_update_publicport_by_name(&new_sps_flag);
+
+	return ret;
+}
+
+
+void gen_iptables_whiteip()
+{
+	int i = 0;
+	int count = 0;
+	FILE *fp = NULL;
+	struct Whiteip *whiteip = NULL;
+
+	utils_syscmd_output(NULL, 0, "/root/yssbc/iptables.sh > /dev/null 2>&1");
+	utils_syscmd_output(NULL, 0, "/bin/systemctl restart yssc > /dev/null 2>&1");
+	sleep(5);
+	fp = fopen(WHITEIP_TMP_PATH, "w");
+	if (!fp) {
+		return;
+	}
+	if (!db_read_whiteip(&whiteip, &count)) {
+		whiteip_tempfile(fp, "FLUSH", NULL);
+		for (i = 0; i < count; i++) {
+			whiteip_tempfile(fp, "ADD", whiteip[i].realip);
+		}
+	}
+	fclose(fp);
+	if (count) {
+		utils_syscmd_output(NULL, 0, "/yeasafe/yssc/bin/yssc --sip-white-list %s", WHITEIP_TMP_PATH);
+	}
+	utils_syscmd_output(NULL, 0, "rm %s", WHITEIP_TMP_PATH);
+	utils_free((void **)&whiteip);
+}
+
+void gen_auth()
+{
+	int i=0;
+	int auth_cnt = 0;
+	struct Authentication auth = {0};
+
+	db_get_count_authentication(&auth_cnt);
+	if(auth_cnt == 0) {
+		for(i = 0; i < 16; i++) {
+			memset(&auth, 0, sizeof(auth));
+			utils_random_string(auth.username,  8, sizeof(auth.username));
+			utils_random_string(auth.password,  16, sizeof(auth.password));
+			db_insert_authentication(&auth);
+		}
+	}
+}
+void gen_network_card()
+{
+	int ser_cnt = 0;
+	char networktype[64] = {0};
+
+	db_get_count_service(&ser_cnt);
+	if(ser_cnt == 0 && get_networkinfo() == 0) {
+		printf("Which network-type do you want to choose?\n\n1.Multi-Network-Card\n2.Single-Network-Card\n\n");
+		printf("Please enter your choose number:");
+		fgets(networktype, sizeof(networktype), stdin);
+		networktype[strlen(networktype) - 1] = '\0';
+		if (!strcmp(networktype, "2")) {
+			networktype_vpc();
+		} else {
+			networktype_classic();
+		}
+	} else {
+		char exist[9] = {0};
+		struct Service *wan_ser = NULL;
+		struct Service *lan_ser = NULL;
+
+		if (!db_read_service_by_type(&lan_ser, "LAN") && lan_ser) {
+			if (!db_read_service_by_type(&wan_ser, "WAN") && wan_ser) {
+				utils_syscmd_output(exist, sizeof(exist), "iptables -t nat -C POSTROUTING -s %s -o %s -j MASQUERADE 2>&1", wan_ser->ipmask, wan_ser->cardname);
+				if (exist[0] && !strcmp(exist, "iptables")) {
+					utils_syscmd_output(NULL, 0, "iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE > /dev/null 2>&1", wan_ser->ipmask, wan_ser->cardname);
+				}
+				if (!strcmp(lan_ser->ipaddr, "192.88.99.100")) { /*Single NetCard*/
+					utils_syscmd_output(NULL, 0, "/sbin/ifconfig %s:1 192.88.99.100 netmask 255.255.255.0", wan_ser->cardname);
+				}
+			}
+			utils_free((void **)&wan_ser);
+		}
+		utils_free((void **)&lan_ser);
+	}
+}
+
+int gen_network_port_config(FILE *fp , char *wanip, char *lanip)
+{
+	int i = 0;
+	int ret = -1;
+	int ser_cnt = 0;
+	struct Service *service = NULL;
+
+	ser_cnt = 0;
+	ret = db_read_service(&service, &ser_cnt);
+	if(ret) {
+		return ret;
+	}
+	for(i = 0; i < ser_cnt; i++){
+		if (!service[i].ipaddr[0]) {
+			continue;
+		}
+		if(!strcmp(service[i].type, "LAN")){
+			snprintf(lanip, sizeof(lanip), "%s", service[i].ipaddr);
+		} else if(!strcmp(service[i].type, "WAN")) {
+			snprintf(wanip, sizeof(wanip), "%s", service[i].ipaddr);
+		}
+		if (utils_is_enable(service[i].udpenable)) {
+			fprintf(fp, "listen=udp:%s:%s\n", service[i].ipaddr, service[i].udpport);
+		}
+		if (utils_is_enable(service[i].tcpenable)) {
+			fprintf(fp, "listen=tcp:%s:%s\n", service[i].ipaddr, service[i].tcpport);
+		}
+		if (utils_is_enable(service[i].tlsenable)) {
+			fprintf(fp, "listen=tls:%s:%s\n", service[i].ipaddr, service[i].tlsport);
+		}
+		if (utils_is_enable(service[i].wssenable)) {
+			fprintf(fp, "listen=wss:%s:%s\n", service[i].ipaddr, service[i].wssport);
+		}
+	}
+
+	if(service) {
+		utils_free((void**)&service);
+	}
+	ret = 0;
+	return ret;
+}
+
+int gen_udp_port_config(char *wanip, char *lanip)
+{
+	char buf[64] = {0};
+	FILE *fp = NULL;
+
+	fp = fopen(LISTEN_CUSTOM_PATH, "r");
+	if(!fp) {
+		return -1;
+	}
+	while (fgets(buf, sizeof(buf), fp) && !feof(fp)) {
+		char type[4] = {0};
+		char transport[8] = {0};
+		char port[8] = {0};
+		char ip[64] = {0};
+
+		if (sscanf(buf, "%[^.].%*[^.].%[^.].%*[^=]=%s", type, transport, port) != 3) {
+			continue;
+		}
+		if (!strcasecmp(type, "LAN")) {
+			snprintf(ip, sizeof(ip), "%s", lanip);
+		} else if (!strcasecmp(type, "WAN")) {
+			snprintf(ip, sizeof(ip), "%s", wanip);
+		} else {
+			continue;
+		}
+		if (!strcasecmp(transport, "udp")) {
+			fprintf(fp, "listen=udp:%s:%s\n", ip, port);
+		} else if (!strcasecmp(transport, "tcp")) {
+			fprintf(fp, "listen=tcp:%s:%s\n", ip, port);
+		} else if (!strcasecmp(transport, "tls")) {
+			fprintf(fp, "listen=tls:%s:%s\n", ip, port);
+		} else if (!strcasecmp(transport, "udp_tcp")) {
+			fprintf(fp, "listen=udp:%s:%s\n", ip, port);
+			fprintf(fp, "listen=tcp:%s:%s\n", ip, port);
+		}
+	}
+	fclose(fp);
+}
+
+
+int gen_spsport_table(int start, int end) 
+{
+	int tbl_start = 0;
+	int tbl_end = 0;
+	db_read_min_max_from_spsportmanage(&tbl_start, &tbl_end);	
+
+	if (start == tbl_start && end == tbl_end) {
+		return 0;
+	}
+	if (tbl_start == 0) { 
+		/*add from start to end*/
+		db_initial_spsport_manage(0, start, end);
+	} else if (tbl_start == start) { 
+		if (end > tbl_end) {
+			/*add from max+1 to end*/
+			db_initial_spsport_manage(0, tbl_end+1, end);
+		} else {
+			/*delete from > end */
+			db_initial_spsport_manage(1, end, 0); 	
+		}
+	} else { 
+		/*delete all and add from start to end*/
+		db_initial_spsport_manage(2, start, end);
+	}
+	return 0;
+}
+
+int gen_sps_port_config(FILE *fp, char *wanip, char *lanip)
+{
+	int ret = -1;
+	int i = 0;
+	int count = 0;
+	int start = 0;
+   	int end = 0;
+	int find = 0;
+	struct PublicPort *pub_port = NULL;
+
+	if(!utils_file_existed(OPEN_SPS_FLAG)) {
+		return ret;
+	}
+
+	if (!fp || !wanip || !lanip) {
+		return ret;
+	}
+
+	db_read_public_port(&pub_port, &count);
+	for (i = 0; i < count; i++) {
+		if (!strcasecmp(pub_port[i].portname, "spsport")) {
+			if (sscanf(pub_port[i].portvalue, "%d-%d", &start, &end) == 2) {
+				printf("start=%d, end=%d\n", start, end);
+				find = 1;
+			}
+		}
+	}
+	utils_free((void **)&pub_port);
+	
+	if (!find) {
+		return ret;
+	}
+	if (start <= 1000 || start >= end) {
+		ret = -2;
+		return ret;
+	}
+	/*generate sql table spsportmanage*/
+	gen_spsport_table(start, end);
+	/*write listen file*/
+	for (i = start; i <= end; i++) {
+		fprintf(fp, "listen=udp:%s:%d use_children 1\n", lanip, i);
+		fprintf(fp, "listen=udp:%s:%d use_children 1\n", wanip, i);
+	}
+
+	ret = 0;
+	return ret;
+}
+
+int gen_listen_port_config()
+{
+	int ret = -1;
+	char wanip[64] = {0};
+	char lanip[64] = {0};
+	FILE *fp = NULL;
+	
+
+	fp = fopen(LISTEN_CONFIG_PATH, "w+");
+	if(!fp) {
+		ret = -1;
+		goto end;
+	}
+	gen_network_port_config(fp, wanip, lanip);
+	gen_udp_port_config(wanip, lanip);
+	gen_sps_port_config(fp, wanip, lanip);
+
+end:
+	if(fp) {
+		fclose(fp);
+	}
+	return ret;
+}
+
+void gen_pubic_config()
+{
+	gen_database(); 			/*Check db,if not exist do upgrade*/
+	gen_iptables_whiteip(); 		/*generate sbc whiteip*/
+	gen_auth();   				/*generate sbc auth name and password*/
+	gen_network_card();			/*enter networkcard info.if exist,check it*/
+	gen_listen_port_config();		/*generate listen port configuration*/
+}
+
+void start_rtpengine()
+{
+	int i = 0;
+	int count = 0;
+	char wanip[64] = {0};
+	char lanip[64] = {0};
+	struct Service *service = NULL;
+
+	count = 0;
+	db_read_service(&service, &count);
+	for(i = 0; i < count; i++){
+		if (!service[i].ipaddr[0]) {
+			continue;
+		}
+		if(!strcmp(service[i].type, "LAN")){
+			snprintf(lanip, sizeof(lanip), "%s", service[i].ipaddr);
+		} else if(!strcmp(service[i].type, "WAN")) {
+			snprintf(wanip, sizeof(wanip), "%s", service[i].ipaddr);
+		}
+	}
+
+	utils_syscmd_output(NULL, 0, "killall -9 rtpengine");
+	if(!wanip[0] || !lanip[0]) {
+		printf("wanip=[%s] or lanip[%s] is null, start rtpengine fail\n", wanip, lanip);
+		return;
+	}
+	utils_syscmd_output(NULL, 0, "rtpengine --table=0 -p /var/run/rtpengine.pid -i external/%s -i internal/%s --sip-source -n 127.0.0.1:7890 -c 127.0.0.1:7891 -m 20000 -M 40000 -E -L 7", wanip, lanip);
+}
+
+int main(int argc, char **argv)
+{
+	int opt;
+	int options_index=0;
+	const char *optstring="yiu::cspr";
+
+	while((opt = getopt_long(argc,argv, optstring, long_options,&options_index)) != EOF ) {
+		switch(opt) {
+			case 'y': 
+				gen_yssc();
+				break;				
+			case 'i': 
+				gen_ipmask();
+				break;
+			case 'u': 
+				gen_useragent(optarg);
+				break;
+			case 'c': 
+				gen_http_cert();
+				break;
+			case 's': 
+				check_spsport();
+				break;
+			case 'p':
+				gen_pubic_config();
+				break;
+			case 'r':
+				start_rtpengine();
+				break;
+		}
+	}
+	return 0;
+}
